@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "LiveTube Voice Dubber V2",
+  "version": "2.0.0",
+  "description": "Tiếp thu tri thức toàn cầu bằng tai thay vì bằng mắt. Lồng tiếng Việt timeline-driven cho YouTube.",
+  "permissions": [
+    "activeTab"
+  ],
+  "host_permissions": [
+    "http://localhost:8765/*",
+    "https://*.youtube.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.youtube.com/watch*"
+      ],
+      "js": [
+        "dist/content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

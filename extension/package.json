@@ -1,0 +1,15 @@
+{
+  "name": "livetube-voice-dubber-v2-extension",
+  "version": "2.0.0",
+  "description": "Chrome Extension for LiveTube Voice Dubber V2",
+  "scripts": {
+    "build": "esbuild src/content.ts --bundle --outfile=dist/content.js",
+    "watch": "esbuild src/content.ts --bundle --outfile=dist/content.js --watch"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "@types/node": "^20.14.2",
+    "esbuild": "^0.21.4",
+    "typescript": "^5.4.5"
+  }
+}

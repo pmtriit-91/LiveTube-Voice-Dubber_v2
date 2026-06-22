@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+extension/node_modules/
+
+# Build outputs
+dist/
+extension/dist/
+
+# Local databases and SQLite temporary files
+*.db
+*.db-shm
+*.db-wal
+livetube_v2.db*
+
+# Downloaded subtitles and generated audios
+subtitles/
+audio/cache/
+*.mp3
+*.vtt
+
+# IDE & OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Configuration and environment secrets
+.env
+
+# Agent config & vendor skills
+.agent/
+.agents/
