@@ -12,11 +12,33 @@ export class DoubleBufferedAudioPlayer {
   private originalVideoVolume = 1.0;
   private fadeInterval: any = null;
 
+  // Trạng thái đồng bộ an toàn (chỉ cho phép sync sau khi audio đã thực sự phát)
+  private isAudioReadyForSync = false;
+
   constructor() {
     this.audioA = new Audio();
     this.audioA.preload = 'auto';
     this.audioB = new Audio();
     this.audioB.preload = 'auto';
+
+    const setupListeners = (audio: HTMLAudioElement) => {
+      audio.addEventListener('playing', () => {
+        if (audio === this.getActiveAudio()) {
+          this.isAudioReadyForSync = true;
+          console.log('[Player] Active audio starts playing. Sync enabled.');
+        }
+      });
+
+      audio.addEventListener('waiting', () => {
+        if (audio === this.getActiveAudio()) {
+          this.isAudioReadyForSync = false;
+          console.log('[Player] Active audio is buffering. Sync temporarily paused.');
+        }
+      });
+    };
+
+    setupListeners(this.audioA);
+    setupListeners(this.audioB);
   }
 
   public setVideoElement(video: HTMLVideoElement) {
@@ -71,6 +93,8 @@ export class DoubleBufferedAudioPlayer {
       // Áp dụng tăng tốc độ phát động nếu bản dịch tiếng Việt dài hơn timeline segment
       this.applyDynamicRate(newActive, segmentDuration);
 
+      this.isAudioReadyForSync = false; // Reset cờ đồng bộ cho câu thoại mới
+
       newActive.play()
         .then(() => {
           this.duckVideoVolume();
@@ -100,6 +124,8 @@ export class DoubleBufferedAudioPlayer {
       // Áp dụng tăng tốc độ phát động nếu bản dịch tiếng Việt dài hơn timeline segment
       this.applyDynamicRate(active, segmentDuration);
 
+      this.isAudioReadyForSync = false; // Reset cờ đồng bộ cho câu thoại mới
+
       active.play()
         .then(() => {
           this.duckVideoVolume();
@@ -128,15 +154,19 @@ export class DoubleBufferedAudioPlayer {
     if (!this.videoElement) return;
     const videoRate = this.videoElement.playbackRate;
 
+    // Đặt tốc độ mặc định ban đầu là tốc độ video để tránh bị lệch ngay khi mới phát
+    audio.playbackRate = videoRate;
+
     const computeRate = () => {
       if (segmentDuration && audio.duration && audio.duration > segmentDuration) {
         const requiredRate = (audio.duration / segmentDuration) * videoRate;
-        // Giới hạn tăng tốc tối đa thêm 35% so với tốc độ phát của video để đảm bảo giọng đọc rõ ràng
         const maxRate = videoRate * 1.35;
-        audio.playbackRate = Math.min(requiredRate, maxRate);
-        console.log(`[Player] Dynamic Speedup: Audio duration ${audio.duration.toFixed(2)}s > Segment duration ${segmentDuration.toFixed(2)}s. Speeding up to ${audio.playbackRate.toFixed(2)}x.`);
-      } else {
-        audio.playbackRate = videoRate;
+        const targetRate = Math.min(requiredRate, maxRate);
+        
+        if (Math.abs(audio.playbackRate - targetRate) > 0.01) {
+          audio.playbackRate = targetRate;
+          console.log(`[Player] Dynamic Speedup: Audio duration ${audio.duration.toFixed(2)}s > Segment duration ${segmentDuration.toFixed(2)}s. Speeding up to ${audio.playbackRate.toFixed(2)}x.`);
+        }
       }
     };
 
@@ -263,6 +293,9 @@ export class DoubleBufferedAudioPlayer {
     
     if (!video || audio.paused || audio.ended || !audio.src) return;
 
+    // Chặn đồng bộ nếu audio chưa sẵn sàng hoặc đang buffering/chưa thực sự phát tiếng
+    if (!this.isAudioReadyForSync || audio.currentTime === 0) return;
+
     // Khoảng thời gian thực tế đã phát trên video kể từ mốc bắt đầu segment
     const videoProgress = video.currentTime - segmentStart;
     const audioProgress = audio.currentTime;
@@ -273,6 +306,7 @@ export class DoubleBufferedAudioPlayer {
     if (Math.abs(drift) > 0.4) {
       console.log(`[Sync] Lệch pha lớn detected (${drift.toFixed(2)}s). Đồng bộ cứng audio.`);
       try {
+        this.isAudioReadyForSync = false; // Tạm dừng sync, chờ audio seek xong và kích hoạt lại event playing
         audio.currentTime = Math.max(0, videoProgress);
       } catch (e) {
         // Bỏ qua lỗi seek khi audio đang buffering
