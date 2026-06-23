@@ -284,10 +284,10 @@ export class DoubleBufferedAudioPlayer {
   }
 
   /**
-   * Kiểm tra lệch pha (Drift check) và tinh chỉnh tinh vi (Micro-adjustments)
-   * @param segmentStart Thời gian bắt đầu câu thoại trên timeline video
+   * Kiểm tra lệch pha (Drift check) một lần duy nhất và tinh chỉnh tốc độ hoặc force-seek
+   * @param audioPlayVideoTime Thời điểm video gốc bắt đầu phát audio lồng tiếng thực tế
    */
-  public checkDriftAndMicroAdjust(segmentStart: number) {
+  public checkDriftAndMicroAdjust(audioPlayVideoTime: number) {
     const video = this.videoElement;
     const audio = this.getActiveAudio();
     
@@ -296,36 +296,41 @@ export class DoubleBufferedAudioPlayer {
     // Chặn đồng bộ nếu audio chưa sẵn sàng hoặc đang buffering/chưa thực sự phát tiếng
     if (!this.isAudioReadyForSync || audio.currentTime === 0) return;
 
-    // Khoảng thời gian thực tế đã phát trên video kể từ mốc bắt đầu segment
-    const videoProgress = video.currentTime - segmentStart;
-    const audioProgress = audio.currentTime;
+    // Tỉ lệ tốc độ phát của audio lồng tiếng so với video gốc
+    const speedRatio = audio.playbackRate / video.playbackRate;
 
-    const drift = videoProgress - audioProgress;
+    // Thời gian thực tế đã trôi qua trên video kể từ lúc bắt đầu phát audio
+    const elapsedVideo = video.currentTime - audioPlayVideoTime;
+    // Thời gian audio đã phát quy đổi tương đương theo giây của video
+    const elapsedAudioInVideoSeconds = audio.currentTime / speedRatio;
+
+    // Độ lệch pha tính theo giây video
+    const drift = elapsedVideo - elapsedAudioInVideoSeconds;
+
+    console.log(`[Sync-Check] elapsedVideo: ${elapsedVideo.toFixed(2)}s, elapsedAudio: ${elapsedAudioInVideoSeconds.toFixed(2)}s. Drift: ${drift.toFixed(2)}s.`);
 
     // 1. Lệch pha nghiêm trọng (> 0.4s): Force-seek audio để bắt kịp video
     if (Math.abs(drift) > 0.4) {
       console.log(`[Sync] Lệch pha lớn detected (${drift.toFixed(2)}s). Đồng bộ cứng audio.`);
       try {
         this.isAudioReadyForSync = false; // Tạm dừng sync, chờ audio seek xong và kích hoạt lại event playing
-        audio.currentTime = Math.max(0, videoProgress);
+        audio.currentTime = Math.max(0, elapsedVideo * speedRatio);
       } catch (e) {
         // Bỏ qua lỗi seek khi audio đang buffering
       }
-      audio.playbackRate = video.playbackRate; // Reset playback rate
       return;
     }
 
-    // 2. Lệch pha nhỏ (0.1s - 0.3s): Tinh chỉnh Micro-adjustments
-    // Điều chỉnh tốc độ audio nhanh/chậm đi 5% để bắt kịp video êm ái không ngắt tiếng
-    if (drift > 0.1) {
-      // Audio đang chậm hơn video: tăng tốc audio lên
-      audio.playbackRate = video.playbackRate * 1.05;
-    } else if (drift < -0.1) {
-      // Audio đang nhanh hơn video: giảm tốc audio đi
-      audio.playbackRate = video.playbackRate * 0.95;
-    } else {
-      // Lệch pha trong ngưỡng cho phép: khôi phục tốc độ chuẩn
-      audio.playbackRate = video.playbackRate;
+    // 2. Lệch pha nhỏ (0.15s - 0.3s): Tinh chỉnh Micro-adjustments
+    // Điều chỉnh tốc độ audio nhanh/chậm đi 5% để bắt kịp video êm ái
+    if (drift > 0.15) {
+      // Audio đang chậm hơn video: tăng tốc audio lên 5%
+      audio.playbackRate = audio.playbackRate * 1.05;
+      console.log(`[Sync] Audio đang chậm. Tăng tốc tạm thời lên: ${audio.playbackRate.toFixed(2)}x.`);
+    } else if (drift < -0.15) {
+      // Audio đang nhanh hơn video: giảm tốc audio đi 5%
+      audio.playbackRate = audio.playbackRate * 0.95;
+      console.log(`[Sync] Audio đang nhanh. Giảm tốc tạm thời xuống: ${audio.playbackRate.toFixed(2)}x.`);
     }
   }
 }

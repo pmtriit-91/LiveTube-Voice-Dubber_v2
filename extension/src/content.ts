@@ -40,11 +40,14 @@ class LiveTubeContentScript {
   private pollInterval: any = null;
   private pollTimeout: any = null;
 
-  // Ngăn chặn vòng lặp Smart Pause vô tận
-  private isSmartPausing = false;
+  // Segment đang chờ phát gối đầu (chờ câu thoại trước đọc xong)
+  private pendingSegment: VideoSegment | null = null;
   
   // Trạng thái chờ sinh audio cho câu thoại hiện tại
   private isWaitingForAudio = false;
+
+  // Thời điểm video gốc bắt đầu phát audio lồng tiếng thực tế của segment hiện tại
+  private audioPlayVideoTime = 0;
 
   constructor() {
     this.sessionId = crypto.randomUUID ? crypto.randomUUID() : this.generateUUID();
@@ -121,12 +124,16 @@ class LiveTubeContentScript {
     this.video.removeEventListener('pause', this.onVideoPause);
     this.video.removeEventListener('play', this.onVideoPlay);
     this.video.removeEventListener('ratechange', this.onPlaybackRateChange);
-
+    this.video.removeEventListener('waiting', this.onVideoPause);
+    this.video.removeEventListener('playing', this.onVideoPlay);
+ 
     this.video.addEventListener('timeupdate', this.onTimeUpdate);
     this.video.addEventListener('seeked', this.onVideoSeek);
     this.video.addEventListener('pause', this.onVideoPause);
     this.video.addEventListener('play', this.onVideoPlay);
     this.video.addEventListener('ratechange', this.onPlaybackRateChange);
+    this.video.addEventListener('waiting', this.onVideoPause);
+    this.video.addEventListener('playing', this.onVideoPlay);
 
     // Inject Shadow DOM UI
     this.ui.injectUI(playerEl, rightControls);
@@ -276,51 +283,16 @@ class LiveTubeContentScript {
 
     const currTime = this.video.currentTime;
 
-    // --- SMART PAUSE LOGIC (Đảm bảo câu thoại trước phải đọc xong mới được đi tiếp) ---
-    if (this.activeSegmentIndex !== -1 && this.state === 'SYNCING') {
-      const activeAudio = this.player.getActiveAudio();
-      const currentSeg = this.segments.find(s => s.index === this.activeSegmentIndex);
-      
-      if (currentSeg && activeAudio && !activeAudio.paused && !activeAudio.ended && activeAudio.duration) {
-        const videoTimeRemaining = currentSeg.end - currTime;
-        const audioTimeRemaining = (activeAudio.duration - activeAudio.currentTime) / activeAudio.playbackRate;
-        
-        // Nếu audio lồng tiếng còn chưa đọc xong và video chuẩn bị (hoặc đã) vượt quá mốc end_time của segment
-        if (audioTimeRemaining > videoTimeRemaining + 0.05 && videoTimeRemaining < 0.3) {
-          if (!this.isSmartPausing) {
-            console.log(`[Smart Pause] Kích hoạt. Chặn nhảy câu. Audio còn ${audioTimeRemaining.toFixed(2)}s, Video còn ${videoTimeRemaining.toFixed(2)}s.`);
-            this.isSmartPausing = true;
-            this.video.pause();
-            
-            const onAudioEnded = () => {
-              if (this.isSmartPausing && this.video) {
-                console.log('[Smart Pause] Audio kết thúc. Tiếp tục phát video.');
-                this.isSmartPausing = false;
-                this.video.play().catch(() => {});
-              }
-              activeAudio.removeEventListener('ended', onAudioEnded);
-            };
-            activeAudio.addEventListener('ended', onAudioEnded);
-          }
-          // Chặn xử lý tìm segment mới khi đang trong trạng thái Smart Pause chờ câu thoại hiện tại kết thúc
-          return;
-        }
-      }
-    }
-
+    // Đã loại bỏ hoàn toàn cơ chế Smart Pause gây khựng video
+ 
     // Tìm segment chứa thời gian hiện tại
     const seg = this.segments.find(s => currTime >= s.start && currTime <= s.end);
-
+ 
     if (seg) {
       if (seg.index !== this.activeSegmentIndex) {
         // Chuyển sang segment mới
         this.activeSegmentIndex = seg.index;
         this.handleSegmentTransition(seg);
-      } else {
-        // Vẫn ở trong segment cũ: Kiểm tra lệch pha & thực hiện Micro-adjustments
-        if (this.state === 'SYNCING') {
-          this.player.checkDriftAndMicroAdjust(seg.start);
-        }
       }
     } else {
       // Nằm ngoài timeline tất cả câu thoại (Silence gap)
@@ -334,13 +306,41 @@ class LiveTubeContentScript {
   };
 
   /**
-   * Xử lý khi chuyển sang câu thoại mới
+   * Xử lý khi chuyển sang câu thoại mới bằng cơ chế gối đầu thông minh
    */
   private handleSegmentTransition(seg: VideoSegment) {
     this.clearPolling();
+    this.pendingSegment = null; // Reset pending segment cũ nếu có
+
+    const activeAudio = this.player.getActiveAudio();
+    const isPlaying = activeAudio && !activeAudio.paused && !activeAudio.ended && activeAudio.src;
+
+    if (isPlaying && seg.audioStatus === 'READY') {
+      console.log(`[Pipeline] Audio cũ vẫn đang chạy. Hoãn phát Segment #${seg.index} để gối đầu.`);
+      this.pendingSegment = seg;
+
+      const onEnded = () => {
+        if (this.pendingSegment && this.pendingSegment.index === seg.index) {
+          const currentPending = this.pendingSegment;
+          this.pendingSegment = null;
+          console.log(`[Pipeline] Audio cũ đã kết thúc. Phát gối đầu Segment #${currentPending.index}.`);
+          this.executeSegmentPlay(currentPending);
+        }
+      };
+
+      activeAudio.addEventListener('ended', onEnded, { once: true });
+    } else {
+      this.executeSegmentPlay(seg);
+    }
+  }
+
+  /**
+   * Thực thi phát audio và các xử lý đồng bộ liên quan
+   */
+  private executeSegmentPlay(seg: VideoSegment) {
+    if (!this.video) return;
 
     // Chuẩn bị URL cho câu hiện tại và câu tiếp theo để preloading
-    const voiceKey = this.config.voice;
     const activeUrl = seg.audioUrl ? `${BACKEND_URL}${seg.audioUrl}` : `${BACKEND_URL}/audio/cache/${seg.cacheKey}.mp3`;
     
     const nextSeg = this.segments.find(s => s.index === seg.index + 1);
@@ -349,20 +349,23 @@ class LiveTubeContentScript {
       : null;
 
     if (seg.audioStatus === 'READY') {
-      // Audio đã có sẵn: Phát ngay lập tức
       this.transitionTo('SYNCING');
       this.ui.updateVisualizer(true);
       this.ui.updateSubtitles(this.config.subMode, seg.sourceText, seg.translatedText);
       
-      this.player.play(activeUrl, preloadUrl, seg.end - seg.start);
+      // Tính toán segmentDuration thực tế còn lại cho audio mới và lưu gốc thời gian bắt đầu phát
+      const currTime = this.video.currentTime;
+      this.audioPlayVideoTime = currTime;
+      const remainingDuration = Math.max(0.1, seg.end - currTime);
+ 
+      this.player.play(activeUrl, preloadUrl, remainingDuration);
 
     } else if (seg.audioStatus === 'PENDING' || seg.audioStatus === 'GENERATING') {
-      // Audio chưa READY: Chuyển sang Polling trạng thái và gửi yêu cầu ON_DEMAND
       this.transitionTo('POLLING_AUDIO');
       this.ui.updateVisualizer(false);
       this.ui.updateSubtitles(this.config.subMode, seg.sourceText, `⏳ [Chuẩn bị giọng đọc...] ${seg.translatedText}`);
 
-      // Smart Pause: Chủ động tạm dừng video để chờ sinh âm thanh, tránh trôi timeline
+      // Smart Pause: Vẫn giữ việc pause video nếu audio chưa được sinh từ server
       if (this.video && !this.video.paused) {
         console.log(`[Smart Pause] Chờ sinh giọng đọc cho câu #${seg.index}. Tạm dừng video.`);
         this.isWaitingForAudio = true;
@@ -373,7 +376,6 @@ class LiveTubeContentScript {
       this.startPolling(seg);
 
     } else {
-      // Trạng thái FAILED: Fallback về tiếng gốc
       this.handleFallbackMode(seg);
     }
   }
@@ -418,7 +420,10 @@ class LiveTubeContentScript {
             this.ui.updateSubtitles(this.config.subMode, seg.sourceText, seg.translatedText);
             
             const activeUrl = `${BACKEND_URL}${data.audioUrl}`;
-            this.player.play(activeUrl, null, seg.end - seg.start);
+            const currTime = this.video.currentTime;
+            this.audioPlayVideoTime = currTime;
+            const remainingDuration = Math.max(0.1, seg.end - currTime);
+            this.player.play(activeUrl, null, remainingDuration);
 
             // Tiếp tục video nếu trước đó bị dừng chờ audio
             if (this.isWaitingForAudio) {
@@ -477,8 +482,9 @@ class LiveTubeContentScript {
     this.ui.updateVisualizer(false);
     
     this.activeSegmentIndex = -1;
-    this.isSmartPausing = false;
-
+    this.pendingSegment = null; // Reset pending segment
+    this.audioPlayVideoTime = 0; // Reset gốc thời gian
+ 
     // Đọc ngay timeline mới
     this.onTimeUpdate();
   };
@@ -489,8 +495,8 @@ class LiveTubeContentScript {
   private onVideoPause = () => {
     if (!this.isDubbingEnabled) return;
     
-    // Nếu đây là pause do Smart Pause hoặc do chờ sinh audio chủ động, không được dừng audio
-    if (this.isSmartPausing || this.isWaitingForAudio) return;
+    // Nếu đây là pause do chờ sinh audio chủ động từ server, không được dừng audio
+    if (this.isWaitingForAudio) return;
 
     console.log('[Script] Video pause. Tạm dừng audio.');
     this.player.pause();
@@ -506,6 +512,13 @@ class LiveTubeContentScript {
     this.player.resume();
     if (this.state === 'SYNCING') {
       this.ui.updateVisualizer(true);
+      
+      // Đo drift 1 lần duy nhất sau khi trình duyệt bắt đầu phát tiếng ổn định
+      setTimeout(() => {
+        if (this.state === 'SYNCING' && this.activeSegmentIndex !== -1) {
+          this.player.checkDriftAndMicroAdjust(this.audioPlayVideoTime);
+        }
+      }, 300);
     }
   };
 
@@ -517,6 +530,13 @@ class LiveTubeContentScript {
     const newRate = this.video.playbackRate;
     console.log(`[Script] Tốc độ phát thay đổi: ${newRate}x`);
     this.player.syncPlaybackRate(newRate);
+
+    // Đo drift 1 lần duy nhất sau khi thay đổi tốc độ
+    setTimeout(() => {
+      if (this.state === 'SYNCING' && this.activeSegmentIndex !== -1) {
+        this.player.checkDriftAndMicroAdjust(this.audioPlayVideoTime);
+      }
+    }, 300);
   };
 
   private renderCurrentSubtitles() {
