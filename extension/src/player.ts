@@ -53,7 +53,7 @@ export class DoubleBufferedAudioPlayer {
   /**
    * Bắt đầu phát câu thoại hiện tại và chuẩn bị tải câu thoại tiếp theo
    */
-  public play(activeUrl: string, preloadUrl: string | null) {
+  public play(activeUrl: string, preloadUrl: string | null, segmentDuration?: number) {
     const active = this.getActiveAudio();
     const preload = this.getPreloadAudio();
 
@@ -67,9 +67,10 @@ export class DoubleBufferedAudioPlayer {
       
       const newActive = this.getActiveAudio();
       newActive.volume = this.defaultDubVolume;
-      if (this.videoElement) {
-        newActive.playbackRate = this.videoElement.playbackRate;
-      }
+      
+      // Áp dụng tăng tốc độ phát động nếu bản dịch tiếng Việt dài hơn timeline segment
+      this.applyDynamicRate(newActive, segmentDuration);
+
       newActive.play()
         .then(() => {
           this.duckVideoVolume();
@@ -95,9 +96,10 @@ export class DoubleBufferedAudioPlayer {
       this.cleanupAudio(active);
       active.src = activeUrl;
       active.volume = this.defaultDubVolume;
-      if (this.videoElement) {
-        active.playbackRate = this.videoElement.playbackRate;
-      }
+      
+      // Áp dụng tăng tốc độ phát động nếu bản dịch tiếng Việt dài hơn timeline segment
+      this.applyDynamicRate(active, segmentDuration);
+
       active.play()
         .then(() => {
           this.duckVideoVolume();
@@ -116,6 +118,32 @@ export class DoubleBufferedAudioPlayer {
           preload.playbackRate = this.videoElement.playbackRate;
         }
       }
+    }
+  }
+
+  /**
+   * Tính toán và điều chỉnh tốc độ phát của audio lồng tiếng để khớp với timeline segment
+   */
+  private applyDynamicRate(audio: HTMLAudioElement, segmentDuration?: number) {
+    if (!this.videoElement) return;
+    const videoRate = this.videoElement.playbackRate;
+
+    const computeRate = () => {
+      if (segmentDuration && audio.duration && audio.duration > segmentDuration) {
+        const requiredRate = (audio.duration / segmentDuration) * videoRate;
+        // Giới hạn tăng tốc tối đa thêm 35% so với tốc độ phát của video để đảm bảo giọng đọc rõ ràng
+        const maxRate = videoRate * 1.35;
+        audio.playbackRate = Math.min(requiredRate, maxRate);
+        console.log(`[Player] Dynamic Speedup: Audio duration ${audio.duration.toFixed(2)}s > Segment duration ${segmentDuration.toFixed(2)}s. Speeding up to ${audio.playbackRate.toFixed(2)}x.`);
+      } else {
+        audio.playbackRate = videoRate;
+      }
+    };
+
+    if (audio.duration) {
+      computeRate();
+    } else {
+      audio.addEventListener('loadedmetadata', computeRate, { once: true });
     }
   }
 

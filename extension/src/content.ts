@@ -354,7 +354,7 @@ class LiveTubeContentScript {
       this.ui.updateVisualizer(true);
       this.ui.updateSubtitles(this.config.subMode, seg.sourceText, seg.translatedText);
       
-      this.player.play(activeUrl, preloadUrl);
+      this.player.play(activeUrl, preloadUrl, seg.end - seg.start);
 
     } else if (seg.audioStatus === 'PENDING' || seg.audioStatus === 'GENERATING') {
       // Audio chưa READY: Chuyển sang Polling trạng thái và gửi yêu cầu ON_DEMAND
@@ -418,7 +418,7 @@ class LiveTubeContentScript {
             this.ui.updateSubtitles(this.config.subMode, seg.sourceText, seg.translatedText);
             
             const activeUrl = `${BACKEND_URL}${data.audioUrl}`;
-            this.player.play(activeUrl, null);
+            this.player.play(activeUrl, null, seg.end - seg.start);
 
             // Tiếp tục video nếu trước đó bị dừng chờ audio
             if (this.isWaitingForAudio) {
