@@ -11,7 +11,7 @@ if (!fs.existsSync(dbDir)) {
 }
 
 // Khởi tạo Database SQLite
-const db = new Database(DB_FILE, { verbose: console.log });
+const db = new Database(DB_FILE);
 
 // Cấu hình tối ưu hóa SQLite cho Multi-tab/Multi-session
 db.pragma('journal_mode = WAL');       // Write-Ahead Logging để cho phép đọc ghi song song
