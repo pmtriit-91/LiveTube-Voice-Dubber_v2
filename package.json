@@ -1,13 +1,13 @@
 {
-  "name": "livetube-voice-dubber-v2",
-  "version": "2.0.0",
-  "description": "LiveTube Voice Dubber V2 Backend Node.js Service",
+  "name": "livetube-voice-dubber-v3",
+  "version": "3.0.0-alpha",
+  "description": "LiveTube Voice Dubber V3 Backend Node.js Service",
   "main": "dist/server.js",
   "scripts": {
     "dev": "ts-node src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "clean": "rm -rf dist livetube_v2.db livetube_v2.db-shm livetube_v2.db-wal"
+    "clean": "rm -rf dist livetube_v3.db livetube_v3.db-shm livetube_v3.db-wal"
   },
   "dependencies": {
     "better-sqlite3": "^11.0.0",
