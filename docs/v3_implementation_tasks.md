@@ -170,6 +170,8 @@ Manual E2E sau Phase 2:
 
 Mục tiêu: tối ưu chất lượng nghe, graceful degradation và UI feedback.
 
+> Phase 3 đã được phản biện lại sau Phase 2.5d. Trước khi triển khai, đọc bản đã chốt tại `docs/phase3/implementation_plan_phase3.md`. Guardrails quan trọng: backend Phase 3A làm trước client fallback, `/prepare` và `/stream` phải dùng chung helper build cache key có estimated rate, không mutate readonly concurrency, và không phá UI Display Pagination.
+
 | ID | Task | Files | Depends | Done when |
 |---|---|---|---|---|
 | T29 | Tạo `rate-estimator` theo công thức 4.5 syllables/s, 1.5 syllables/word | `src/runtime/rate-estimator.ts` | T16 | rate clamp tối đa `+40%` |

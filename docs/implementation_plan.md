@@ -343,6 +343,8 @@ audio.addEventListener('canplay', () => {
 
 ## Phase 3: Polish & Smart Buffering (Estimated: 3 giờ)
 
+> Superseded note: Phase 3 đã được phản biện lại sau Phase 2.5d. Không triển khai trực tiếp theo snippet cũ trong mục này, đặc biệt phần mutate `MAX_CONCURRENT` và rate estimator chưa xét cache key. Bản chốt hiện tại nằm ở `docs/phase3/implementation_plan_phase3.md`.
+
 ### Mục tiêu
 Tinh chỉnh trải nghiệm sau khi hệ thống đã chạy E2E. Tối ưu sliding window, dynamic rate, và edge case.
 
