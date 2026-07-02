@@ -34,7 +34,13 @@ export interface TTSQueueStats {
   cancelled: number;
   activeWorkers: number;
   maxConcurrent: number;
+  baseMaxConcurrent: number;
+  currentMaxConcurrent: number;
   maxSessionConcurrent: number;
+  isThrottled: boolean;
+  recentFailures: number;
+  lastFailureAt: number | null;
+  lastSuccessAt: number | null;
 }
 
 export interface TTSQueueOptions {
@@ -45,8 +51,11 @@ export interface TTSQueueOptions {
 
 export class TTSQueueV3 extends EventEmitter {
   private readonly cache: AudioCache;
-  private readonly maxConcurrent: number;
+  private readonly baseMaxConcurrent: number;
   private readonly maxSessionConcurrent: number;
+  private readonly failureThreshold: number;
+  private readonly failureWindowMs: number;
+  private readonly recoveryDelayMs: number;
   private readonly jobs: QueueJob[] = [];
   private readonly sessionActiveCounts = new Map<string, number>();
   private activeWorkers = 0;
@@ -54,12 +63,25 @@ export class TTSQueueV3 extends EventEmitter {
   private failedJobs = 0;
   private cancelledJobs = 0;
   private isProcessing = false;
+  private currentMaxConcurrent: number;
+  private isThrottled = false;
+  private failureTimestamps: number[] = [];
+  private lastFailureAt = 0;
+  private lastSuccessAt = 0;
+  private recoveryTimer: NodeJS.Timeout | null = null;
 
   constructor(options: TTSQueueOptions = {}) {
     super();
     this.cache = options.cache || audioCache;
-    this.maxConcurrent = options.maxConcurrent || Number(process.env.TTS_MAX_CONCURRENT || 3);
-    this.maxSessionConcurrent = options.maxSessionConcurrent || Number(process.env.TTS_MAX_SESSION_CONCURRENT || 3);
+    this.baseMaxConcurrent = readPositiveInteger(options.maxConcurrent, readPositiveInteger(process.env.TTS_MAX_CONCURRENT, 3));
+    this.currentMaxConcurrent = this.baseMaxConcurrent;
+    this.maxSessionConcurrent = readPositiveInteger(
+      options.maxSessionConcurrent,
+      readPositiveInteger(process.env.TTS_MAX_SESSION_CONCURRENT, 3)
+    );
+    this.failureThreshold = readPositiveInteger(process.env.TTS_THROTTLE_FAILURE_THRESHOLD, 3);
+    this.failureWindowMs = readPositiveInteger(process.env.TTS_THROTTLE_FAILURE_WINDOW_MS, 30_000);
+    this.recoveryDelayMs = readPositiveInteger(process.env.TTS_THROTTLE_RECOVERY_MS, 120_000);
 
     this.on('job:added', () => this.triggerProcessing());
     this.on('job:finished', () => this.triggerProcessing());
@@ -132,7 +154,7 @@ export class TTSQueueV3 extends EventEmitter {
     this.isProcessing = true;
 
     try {
-      while (this.activeWorkers < this.maxConcurrent) {
+      while (this.activeWorkers < this.currentMaxConcurrent) {
         const nextJob = this.takeNextEligibleJob();
         if (!nextJob) {
           break;
@@ -161,8 +183,14 @@ export class TTSQueueV3 extends EventEmitter {
       failed: this.failedJobs,
       cancelled: this.cancelledJobs,
       activeWorkers: this.activeWorkers,
-      maxConcurrent: this.maxConcurrent,
-      maxSessionConcurrent: this.maxSessionConcurrent
+      maxConcurrent: this.currentMaxConcurrent,
+      baseMaxConcurrent: this.baseMaxConcurrent,
+      currentMaxConcurrent: this.currentMaxConcurrent,
+      maxSessionConcurrent: this.maxSessionConcurrent,
+      isThrottled: this.isThrottled,
+      recentFailures: this.getRecentFailureCount(Date.now()),
+      lastFailureAt: this.lastFailureAt > 0 ? this.lastFailureAt : null,
+      lastSuccessAt: this.lastSuccessAt > 0 ? this.lastSuccessAt : null
     };
   }
 
@@ -237,6 +265,7 @@ export class TTSQueueV3 extends EventEmitter {
         job.status = 'COMPLETED';
         job.updatedAt = Date.now();
         this.completedJobs++;
+        this.recordJobSuccess(job);
         this.cache.markReady(job.cacheKey);
         this.releaseWorker(job);
         this.emit('job:completed', job);
@@ -257,6 +286,7 @@ export class TTSQueueV3 extends EventEmitter {
     job.error = error.message;
     job.updatedAt = Date.now();
     this.failedJobs++;
+    this.recordJobFailure(job, error);
     this.cache.markFailed(job.cacheKey, error);
     this.releaseWorker(job);
     this.emit('job:failed', job);
@@ -297,6 +327,113 @@ export class TTSQueueV3 extends EventEmitter {
     }
   }
 
+  private recordJobSuccess(job: QueueJob): void {
+    const now = Date.now();
+    this.lastSuccessAt = now;
+    this.failureTimestamps = [];
+
+    this.logQueueEvent('job.completed', {
+      sessionId: job.sessionId,
+      segmentIndex: job.segmentIndex,
+      rate: job.rate,
+      bytesStatus: 'ready'
+    });
+
+    if (this.isThrottled) {
+      this.scheduleRecovery();
+    }
+  }
+
+  private recordJobFailure(job: QueueJob, error: Error): void {
+    const now = Date.now();
+    this.lastFailureAt = now;
+    this.failureTimestamps.push(now);
+    this.pruneFailureWindow(now);
+    this.clearRecoveryTimer();
+
+    this.logQueueEvent('job.failed', {
+      sessionId: job.sessionId,
+      segmentIndex: job.segmentIndex,
+      rate: job.rate,
+      recentFailures: this.failureTimestamps.length,
+      error: error.message
+    });
+
+    if (this.failureTimestamps.length >= this.failureThreshold) {
+      this.activateThrottle();
+    }
+  }
+
+  private activateThrottle(): void {
+    if (this.isThrottled && this.currentMaxConcurrent === 1) {
+      return;
+    }
+
+    this.isThrottled = true;
+    this.currentMaxConcurrent = 1;
+
+    this.logQueueEvent('throttle.enabled', {
+      recentFailures: this.failureTimestamps.length,
+      failureWindowMs: this.failureWindowMs,
+      baseMaxConcurrent: this.baseMaxConcurrent,
+      currentMaxConcurrent: this.currentMaxConcurrent
+    });
+  }
+
+  private scheduleRecovery(): void {
+    this.clearRecoveryTimer();
+
+    this.recoveryTimer = setTimeout(() => {
+      this.recoveryTimer = null;
+
+      const now = Date.now();
+      const noRecentFailures = now - this.lastFailureAt >= this.recoveryDelayMs;
+      if (!this.isThrottled || !noRecentFailures || this.lastSuccessAt === 0) {
+        return;
+      }
+
+      this.isThrottled = false;
+      this.currentMaxConcurrent = this.baseMaxConcurrent;
+      this.failureTimestamps = [];
+
+      this.logQueueEvent('throttle.recovered', {
+        recoveryDelayMs: this.recoveryDelayMs,
+        currentMaxConcurrent: this.currentMaxConcurrent
+      });
+
+      this.triggerProcessing();
+    }, this.recoveryDelayMs);
+    this.recoveryTimer.unref?.();
+  }
+
+  private clearRecoveryTimer(): void {
+    if (this.recoveryTimer === null) {
+      return;
+    }
+
+    clearTimeout(this.recoveryTimer);
+    this.recoveryTimer = null;
+  }
+
+  private getRecentFailureCount(now: number): number {
+    this.pruneFailureWindow(now);
+    return this.failureTimestamps.length;
+  }
+
+  private pruneFailureWindow(now: number): void {
+    const threshold = now - this.failureWindowMs;
+    this.failureTimestamps = this.failureTimestamps.filter((timestamp) => timestamp >= threshold);
+  }
+
+  private logQueueEvent(event: string, payload: Record<string, unknown>): void {
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(),
+      component: 'tts-queue',
+      event,
+      ...payload
+    }));
+  }
+
   private createSkippedJob(input: QueueJobInput, cacheKey: string, reason: 'READY' | 'GENERATING'): QueueJob {
     const now = Date.now();
     return {
@@ -317,3 +454,8 @@ export class TTSQueueV3 extends EventEmitter {
 }
 
 export const ttsQueue = new TTSQueueV3();
+
+function readPositiveInteger(value: number | string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}

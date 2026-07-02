@@ -10,6 +10,11 @@ import db, {
 import { downloadSubtitles, parseVtt, reconstructSentences } from './utils/yt-dlp';
 import { translateBatch } from './utils/translator';
 import { audioCache, buildAudioCacheKey, AudioCacheKeyParts } from './runtime/audio-cache';
+import {
+  estimateRateDetails,
+  estimateTTSTimeoutMs
+} from './runtime/rate-estimator';
+import type { RateEstimate } from './runtime/rate-estimator';
 import { ttsQueue } from './runtime/tts-queue';
 
 dotenv.config();
@@ -17,6 +22,7 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT || 8765);
 const DEFAULT_LOOK_AHEAD = 5;
+const RATE_ESTIMATOR_ENABLED = process.env.RATE_ESTIMATOR_ENABLED !== 'false';
 
 type PrepareMode = 'INITIAL' | 'PLAYBACK' | 'SEEK';
 
@@ -40,6 +46,14 @@ interface TimelineSegment {
   end: number;
   sourceText: string;
   translatedText: string;
+}
+
+interface SegmentAudioPlan {
+  parts: AudioCacheKeyParts;
+  cacheKey: string;
+  text: string;
+  timeoutMs: number;
+  rateEstimate: RateEstimate;
 }
 
 app.use(cors({
@@ -83,14 +97,83 @@ function getSegmentOrNull(videoId: string, segmentIndex: number): SegmentRecord 
   return (statements.getSegmentByVideoId.get(videoId, segmentIndex) as SegmentRecord | undefined) || null;
 }
 
-function buildAudioParts(session: SessionRecord, segmentIndex: number): AudioCacheKeyParts {
-  return {
+function getSegmentText(segment: SegmentRecord): string {
+  return segment.translated_text || segment.source_text;
+}
+
+function getSegmentDuration(segment: SegmentRecord): number {
+  return Math.max(0.1, segment.end_time - segment.start_time);
+}
+
+function buildAudioPlanForSegment(session: SessionRecord, segment: SegmentRecord): SegmentAudioPlan {
+  const text = getSegmentText(segment);
+  const segmentDuration = getSegmentDuration(segment);
+  const rateEstimate = estimateRateDetails(text, segmentDuration, {
+    baseRate: session.rate,
+    enabled: RATE_ESTIMATOR_ENABLED
+  });
+  const timeoutMs = estimateTTSTimeoutMs(text, rateEstimate);
+  const parts: AudioCacheKeyParts = {
     sessionId: session.id,
-    segmentIndex,
+    segmentIndex: segment.segment_index,
     voice: session.voice,
-    rate: session.rate,
+    rate: rateEstimate.rate,
     volume: session.volume
   };
+
+  return {
+    parts,
+    cacheKey: buildAudioCacheKey(parts),
+    text,
+    timeoutMs,
+    rateEstimate
+  };
+}
+
+function logStructured(event: string, payload: Record<string, unknown>): void {
+  console.log(JSON.stringify({
+    ts: new Date().toISOString(),
+    component: 'server',
+    event,
+    ...payload
+  }));
+}
+
+function logRateDecision(session: SessionRecord, plan: SegmentAudioPlan): void {
+  if (plan.rateEstimate.speedupPercent <= 0 && plan.rateEstimate.rate === plan.rateEstimate.baseRate) {
+    return;
+  }
+
+  logStructured('rate.estimated', {
+    sessionId: session.id,
+    videoId: session.video_id,
+    segmentIndex: plan.parts.segmentIndex,
+    baseRate: plan.rateEstimate.baseRate,
+    estimatedRate: plan.rateEstimate.rate,
+    speedupPercent: plan.rateEstimate.speedupPercent,
+    clamped: plan.rateEstimate.clamped,
+    tokenCount: plan.rateEstimate.tokenCount,
+    textLength: plan.rateEstimate.textLength,
+    segmentDurationSeconds: Number(plan.rateEstimate.segmentDurationSeconds.toFixed(2)),
+    estimatedDurationSeconds: Number(plan.rateEstimate.estimatedDurationSeconds.toFixed(2)),
+    timeoutMs: plan.timeoutMs
+  });
+}
+
+function logAudioCacheDecision(
+  event: string,
+  session: SessionRecord,
+  plan: SegmentAudioPlan,
+  cacheStatus: string
+): void {
+  logStructured(event, {
+    sessionId: session.id,
+    videoId: session.video_id,
+    segmentIndex: plan.parts.segmentIndex,
+    cacheStatus,
+    rate: plan.parts.rate,
+    timeoutMs: plan.timeoutMs
+  });
 }
 
 function getPriorityForMode(mode: PrepareMode): number {
@@ -246,9 +329,16 @@ app.post(
         continue;
       }
 
-      const parts = buildAudioParts(session, segmentIndex);
-      const cacheKey = buildAudioCacheKey(parts);
-      const existingEntry = audioCache.get(cacheKey);
+      const plan = buildAudioPlanForSegment(session, segment);
+      logRateDecision(session, plan);
+
+      const existingEntry = audioCache.get(plan.cacheKey);
+      logAudioCacheDecision(
+        'prepare.cache',
+        session,
+        plan,
+        existingEntry?.status || 'MISS'
+      );
 
       if (existingEntry?.status === 'READY') {
         ready.push(segmentIndex);
@@ -261,14 +351,15 @@ app.post(
       }
 
       if (existingEntry?.status === 'FAILED') {
-        audioCache.delete(cacheKey);
+        audioCache.delete(plan.cacheKey);
         failed.push(segmentIndex);
       }
 
       ttsQueue.enqueue({
-        ...parts,
-        text: segment.translated_text || segment.source_text,
-        priority
+        ...plan.parts,
+        text: plan.text,
+        priority,
+        timeoutMs: plan.timeoutMs
       });
       queued.push(segmentIndex);
     }
@@ -308,15 +399,22 @@ app.get('/api/stream/:sessionId/:segmentIndex', (req: Request, res: Response) =>
     return;
   }
 
-  const parts = buildAudioParts(session, segmentIndex);
-  const cacheKey = buildAudioCacheKey(parts);
-  const existingEntry = audioCache.get(cacheKey);
+  const plan = buildAudioPlanForSegment(session, segment);
+  logRateDecision(session, plan);
+
+  const existingEntry = audioCache.get(plan.cacheKey);
+  logAudioCacheDecision(
+    'stream.cache',
+    session,
+    plan,
+    existingEntry?.status || 'MISS'
+  );
 
   if (existingEntry?.status === 'FAILED') {
-    audioCache.delete(cacheKey);
+    audioCache.delete(plan.cacheKey);
   }
 
-  const entry = audioCache.getOrCreate(parts);
+  const entry = audioCache.getOrCreate(plan.parts);
 
   res.setHeader('Content-Type', 'audio/mpeg');
   res.setHeader('Cache-Control', 'no-store');
@@ -329,9 +427,10 @@ app.get('/api/stream/:sessionId/:segmentIndex', (req: Request, res: Response) =>
 
   if (entry.status === 'PENDING') {
     ttsQueue.enqueue({
-      ...parts,
-      text: segment.translated_text || segment.source_text,
-      priority: 0
+      ...plan.parts,
+      text: plan.text,
+      priority: 0,
+      timeoutMs: plan.timeoutMs
     });
   }
 });
