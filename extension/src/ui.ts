@@ -9,6 +9,7 @@ export class GhostInterfaceManager {
   private shadow: ShadowRoot | null = null;
   private popover: HTMLDivElement | null = null;
   private subOverlay: HTMLDivElement | null = null;
+  private loadingOverlay: HTMLDivElement | null = null;
   private controlBtn: HTMLButtonElement | null = null;
 
   private onToggleCallback: (enabled: boolean) => void = () => {};
@@ -234,6 +235,8 @@ export class GhostInterfaceManager {
         z-index: 2000;
         pointer-events: none;
         box-sizing: border-box;
+        max-height: 28%;
+        overflow: hidden;
       }
 
       .sub-en {
@@ -243,6 +246,11 @@ export class GhostInterfaceManager {
         text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0 2px 4px rgba(0,0,0,0.85);
         margin: 0 0 6px 0;
         font-weight: normal;
+        line-height: 1.35;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
       }
 
       .sub-vi {
@@ -252,6 +260,52 @@ export class GhostInterfaceManager {
         font-weight: bold;
         text-shadow: -1.5px -1.5px 0 #000, 1.5px -1.5px 0 #000, -1.5px 1.5px 0 #000, 1.5px 1.5px 0 #000, 0 2px 6px rgba(0,0,0,0.95);
         margin: 0;
+        line-height: 1.35;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+      }
+
+      #livetube-loading-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 2100;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        pointer-events: none;
+        background: rgba(0, 0, 0, 0.32);
+        backdrop-filter: blur(1.5px);
+        -webkit-backdrop-filter: blur(1.5px);
+      }
+
+      .loading-panel {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 12px 16px;
+        border-radius: 8px;
+        background: rgba(17, 24, 39, 0.86);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+        color: #f9fafb;
+        font-family: system-ui, -apple-system, sans-serif;
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .loading-spinner {
+        width: 18px;
+        height: 18px;
+        border-radius: 999px;
+        border: 2px solid rgba(255, 255, 255, 0.26);
+        border-top-color: #10b981;
+        animation: livetube-spin 0.8s linear infinite;
+      }
+
+      @keyframes livetube-spin {
+        to { transform: rotate(360deg); }
       }
 
       /* Visualizer bar indicator */
@@ -309,7 +363,7 @@ export class GhostInterfaceManager {
     this.popover.id = 'livetube-popover';
     this.popover.innerHTML = `
       <div class="header">
-        <span class="title">LiveTube Dubber V2</span>
+        <span class="title">LiveTube Dubber V3</span>
         <span id="dubber-status" class="status-badge offline">Checking...</span>
       </div>
       <div class="row">
@@ -348,7 +402,7 @@ export class GhostInterfaceManager {
       </div>
       <div style="margin-top: 14px; padding-top: 10px; border-top: 1px solid rgba(255, 255, 255, 0.08); display: flex; justify-content: space-between; align-items: center; font-size: 9px; color: #71717a;">
         <span>Mission: Tri thức cho người Việt</span>
-        <span>Version 2.0</span>
+        <span>Version 3.0</span>
       </div>
     `;
     this.shadow.appendChild(this.popover);
@@ -361,6 +415,16 @@ export class GhostInterfaceManager {
       <p id="livetube-sub-vi" class="sub-vi" style="display: none;"></p>
     `;
     this.shadow.appendChild(this.subOverlay);
+
+    this.loadingOverlay = document.createElement('div');
+    this.loadingOverlay.id = 'livetube-loading-overlay';
+    this.loadingOverlay.innerHTML = `
+      <div class="loading-panel">
+        <div class="loading-spinner"></div>
+        <span id="livetube-loading-message">Đang chuẩn bị...</span>
+      </div>
+    `;
+    this.shadow.appendChild(this.loadingOverlay);
 
     // 4. Inject shadow host vào player container để fullscreen chuẩn
     playerElement.appendChild(this.shadowHost);
@@ -377,7 +441,7 @@ export class GhostInterfaceManager {
 
     this.controlBtn = document.createElement('button');
     this.controlBtn.className = 'ytp-button livetube-dub-button';
-    this.controlBtn.title = 'LiveTube Dubber V2';
+    this.controlBtn.title = 'LiveTube Dubber V3';
     this.controlBtn.style.width = '46px';
     this.controlBtn.style.height = '100%';
     this.controlBtn.style.display = 'inline-flex';
@@ -557,22 +621,37 @@ export class GhostInterfaceManager {
     if (subMode === 'vi' && viText) {
       enEl.style.display = 'none';
       viEl.textContent = viText;
-      viEl.style.display = 'block';
+      viEl.style.display = '-webkit-box';
     } else if (subMode === 'bilingual') {
       if (enText) {
         enEl.textContent = enText;
-        enEl.style.display = 'block';
+        enEl.style.display = '-webkit-box';
       } else {
         enEl.style.display = 'none';
       }
 
       if (viText) {
         viEl.textContent = viText;
-        viEl.style.display = 'block';
+        viEl.style.display = '-webkit-box';
       } else {
         viEl.style.display = 'none';
       }
     }
+  }
+
+  public showLoadingOverlay(message = 'Đang chuẩn bị...') {
+    if (!this.shadow || !this.loadingOverlay) return;
+    const label = this.shadow.querySelector('#livetube-loading-message');
+
+    if (label) {
+      label.textContent = message;
+    }
+    this.loadingOverlay.style.display = 'flex';
+  }
+
+  public hideLoadingOverlay() {
+    if (!this.loadingOverlay) return;
+    this.loadingOverlay.style.display = 'none';
   }
 
   public destroy() {
@@ -586,6 +665,7 @@ export class GhostInterfaceManager {
     this.shadow = null;
     this.popover = null;
     this.subOverlay = null;
+    this.loadingOverlay = null;
     this.controlBtn = null;
   }
 }

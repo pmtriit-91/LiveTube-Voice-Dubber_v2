@@ -5,6 +5,10 @@ import { promisify } from 'util';
 
 const execPromise = promisify(exec);
 const SUBTITLE_DIR = path.join(process.cwd(), 'subtitles');
+const DISPLAY_SOFT_CHAR_LIMIT = 90;
+const SENTENCE_SOFT_DURATION_LIMIT = 10.0;
+const SENTENCE_HARD_CHAR_LIMIT = 250;
+const SENTENCE_HARD_DURATION_LIMIT = 15.0;
 
 // Đảm bảo thư mục phụ đề tồn tại
 if (!fs.existsSync(SUBTITLE_DIR)) {
@@ -195,41 +199,52 @@ export function reconstructSentences(chunks: RawSubtitleChunk[]): ReconstructedS
   let currentGroup: RawSubtitleChunk[] = [];
   let sentenceId = 1;
 
-  for (const chunk of chunks) {
+  const flushCurrentGroup = () => {
+    const sentence = buildSentence(sentenceId, currentGroup);
+    if (sentence) {
+      reconstructed.push(sentence);
+      sentenceId++;
+    }
+    currentGroup = [];
+  };
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const nextChunk = chunks[i + 1] || null;
+
     if (currentGroup.length > 0) {
-      // Ngắt câu thoại khi có khoảng lặng tự nhiên giữa 2 dòng phụ đề (gap >= 1.0 giây)
       const gap = chunk.start - currentGroup[currentGroup.length - 1].end;
       if (gap >= 1.0) {
-        const sentence = buildSentence(sentenceId, currentGroup);
-        if (sentence) {
-          reconstructed.push(sentence);
-          sentenceId++;
+        const accumulatedText = currentGroup.map(c => c.text).join(' ');
+        if (isCompleteSentenceFragment(accumulatedText) || gap >= 3.0) {
+          flushCurrentGroup();
         }
-        currentGroup = [];
       }
     }
 
     currentGroup.push(chunk);
     const text = chunk.text;
     
-    // Ngắt câu khi có dấu chấm câu kết thúc
-    let isEnd = text.endsWith('.') || text.endsWith('?') || text.endsWith('!') ||
-                 text.endsWith('."') || text.endsWith('?"') || text.endsWith('!"');
+    // Dấu câu chỉ là tín hiệu ngắt khi chunk kế tiếp không nối tiếp ý.
+    let isEnd = shouldSplitOnPunctuation(text, nextChunk?.text || null);
 
-    // Giới hạn độ dài tránh câu quá dài
+    // Soft-cap ưu tiên ranh giới mệnh đề để phụ đề vừa 1-2 dòng; hard-cap tránh gom vô hạn.
     const accumulatedLen = currentGroup.reduce((sum, c) => sum + c.text.length, 0);
     const duration = chunk.end - currentGroup[0].start;
-    if (accumulatedLen > 220 || duration > 14.0) {
-      isEnd = true;
+    if (accumulatedLen > DISPLAY_SOFT_CHAR_LIMIT || duration > SENTENCE_SOFT_DURATION_LIMIT) {
+      const accumulatedText = currentGroup.map(c => c.text).join(' ');
+      if (
+        (accumulatedLen > DISPLAY_SOFT_CHAR_LIMIT && isClauseBoundary(text, nextChunk?.text || null)) ||
+        isCompleteSentenceFragment(accumulatedText) ||
+        accumulatedLen > SENTENCE_HARD_CHAR_LIMIT ||
+        duration > SENTENCE_HARD_DURATION_LIMIT
+      ) {
+        isEnd = true;
+      }
     }
 
     if (isEnd) {
-      const sentence = buildSentence(sentenceId, currentGroup);
-      if (sentence) {
-        reconstructed.push(sentence);
-        sentenceId++;
-      }
-      currentGroup = [];
+      flushCurrentGroup();
     }
   }
 
@@ -241,7 +256,135 @@ export function reconstructSentences(chunks: RawSubtitleChunk[]): ReconstructedS
     }
   }
 
-  return reconstructed;
+  return mergeOrphanFragments(reconstructed);
+}
+
+const INCOMPLETE_ENDINGS = new Set([
+  'the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'with',
+  'by', 'from', 'and', 'or', 'but', 'nor', 'so', 'yet',
+  'is', 'are', 'was', 'were', 'be', 'been', 'being',
+  'has', 'have', 'had', 'do', 'does', 'did',
+  'will', 'would', 'could', 'should', 'might', 'may', 'can',
+  'this', 'that', 'these', 'those', 'my', 'your', 'his', 'her',
+  'its', 'our', 'their', 'some', 'any', 'no', 'every',
+  'not', 'very', 'really', 'just', 'also', 'more', 'most',
+  'who', 'which', 'where', 'when', 'how', 'what', 'why',
+  'if', 'then', 'than', 'as'
+]);
+
+const CONTINUATION_STARTERS = new Set([
+  'and', 'but', 'or', 'so', 'because', 'since', 'although',
+  'however', 'therefore', 'moreover', 'furthermore',
+  'if', 'unless', 'while', 'whereas', 'though',
+  'which', 'who', 'that', 'where', 'when'
+]);
+
+const CLAUSE_STARTERS = new Set([
+  'and', 'but', 'or', 'so', 'because', 'since', 'although',
+  'however', 'therefore', 'moreover', 'furthermore',
+  'if', 'then', 'unless', 'while', 'whereas', 'though',
+  'which', 'who', 'that', 'where', 'when', 'why', 'what', 'how'
+]);
+
+function isCompleteSentenceFragment(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (/[.!?]["']?$/.test(trimmed)) return true;
+  if (/[,;:—-]$/.test(trimmed)) return false;
+
+  const lastWord = trimmed
+    .split(/\s+/)
+    .pop()
+    ?.toLowerCase()
+    .replace(/[^a-z']/g, '') || '';
+
+  if (INCOMPLETE_ENDINGS.has(lastWord)) return false;
+  if (trimmed.length < 20) return false;
+
+  return true;
+}
+
+function shouldSplitOnPunctuation(currentChunkText: string, nextChunkText: string | null): boolean {
+  const currentTrimmed = currentChunkText.trim();
+  if (!/[.!?]["']?$/.test(currentTrimmed)) return false;
+  if (!nextChunkText) return true;
+
+  const nextTrimmed = nextChunkText.trim();
+  const firstWord = getFirstNormalizedWord(nextTrimmed);
+
+  if (CONTINUATION_STARTERS.has(firstWord)) return false;
+  if (/^[a-z]/.test(nextTrimmed)) return false;
+
+  return true;
+}
+
+function isClauseBoundary(currentChunkText: string, nextChunkText: string | null): boolean {
+  if (!nextChunkText) return false;
+
+  const currentTrimmed = currentChunkText.trim();
+  if (!/[,;]["']?$/.test(currentTrimmed)) return false;
+
+  const nextTrimmed = nextChunkText.trim();
+  const firstWord = getFirstNormalizedWord(nextTrimmed);
+
+  if (CLAUSE_STARTERS.has(firstWord)) return true;
+  return /^[A-Z]/.test(nextTrimmed);
+}
+
+function getFirstNormalizedWord(text: string): string {
+  return text
+    .trim()
+    .split(/\s+/)[0]
+    ?.toLowerCase()
+    .replace(/[^a-z']/g, '') || '';
+}
+
+function mergeOrphanFragments(sentences: ReconstructedSentence[]): ReconstructedSentence[] {
+  if (sentences.length <= 1) return sentences;
+
+  const merged: ReconstructedSentence[] = [];
+
+  for (let i = 0; i < sentences.length; i++) {
+    const current = sentences[i];
+
+    if (
+      merged.length > 0 &&
+      isOrphanFragment(current.sourceText) &&
+      current.start - merged[merged.length - 1].end < 1.5
+    ) {
+      const previous = merged[merged.length - 1];
+      previous.sourceText = `${previous.sourceText} ${current.sourceText}`.replace(/\s+/g, ' ').trim();
+      previous.end = current.end;
+      continue;
+    }
+
+    if (
+      i + 1 < sentences.length &&
+      isOrphanFragment(current.sourceText) &&
+      sentences[i + 1].start - current.end < 1.5
+    ) {
+      const next = sentences[i + 1];
+      next.sourceText = `${current.sourceText} ${next.sourceText}`.replace(/\s+/g, ' ').trim();
+      next.start = current.start;
+      continue;
+    }
+
+    merged.push({ ...current });
+  }
+
+  return merged.map((sentence, index) => ({
+    ...sentence,
+    index: index + 1,
+    translatedText: null
+  }));
+}
+
+function isOrphanFragment(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || /[.!?]["']?$/.test(trimmed)) return false;
+
+  const wordCount = trimmed.split(/\s+/).length;
+  return wordCount < 5 || trimmed.length < 30;
 }
 
 function buildSentence(id: number, group: RawSubtitleChunk[]): ReconstructedSentence | null {
@@ -250,8 +393,8 @@ function buildSentence(id: number, group: RawSubtitleChunk[]): ReconstructedSent
   let combinedText = group.map(c => c.text).join(' ');
   combinedText = combinedText.replace(/\s+/g, ' ').trim();
 
-  // Loại bỏ câu thoại có thời lượng quá ngắn hoặc trống chữ
-  if (endTime - startTime >= 0.5 && combinedText.length > 0) {
+  // Giữ lại fragment ngắn có chữ để merge-pass xử lý orphan trước khi trả output cuối.
+  if ((endTime - startTime >= 0.5 || isOrphanFragment(combinedText)) && combinedText.length > 0) {
     return {
       index: id,
       start: startTime,

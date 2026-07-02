@@ -167,7 +167,11 @@ class LiveTubeContentScript {
     this.transitionTo('INITIALIZING');
     this.ui.updateStatusBadge('active', 'Dịch...');
     this.ui.updateVisualizer(false);
-    this.ui.updateSubtitles('vi', null, 'Đang chuẩn bị phụ đề dịch...');
+    this.ui.updateSubtitles('off', null, null);
+    this.ui.showLoadingOverlay('Đang chuẩn bị phụ đề dịch...');
+    const loadingSafetyTimeout = window.setTimeout(() => {
+      this.ui.hideLoadingOverlay();
+    }, 15_000);
 
     try {
       const session = await this.createSession();
@@ -181,7 +185,7 @@ class LiveTubeContentScript {
       const anchor = this.findAnchorSegment(this.video?.currentTime || 0);
       this.transitionTo('BUFFERING');
       this.ui.updateStatusBadge('active', 'Buffering');
-      this.ui.updateSubtitles('vi', null, 'Đang chuẩn bị giọng đọc...');
+      this.ui.showLoadingOverlay('Đang chuẩn bị giọng đọc...');
 
       if (this.video && !this.video.paused) {
         this.video.pause();
@@ -201,8 +205,11 @@ class LiveTubeContentScript {
     } catch (error) {
       console.error('[LiveTube ERROR] Failed to enable dubbing:', error);
       this.ui.updateStatusBadge('offline', 'Lỗi');
-      this.ui.updateSubtitles('vi', null, `Lỗi: ${(error as Error).message}`);
+      this.resumeVideo();
       this.disableDubbing(false);
+    } finally {
+      window.clearTimeout(loadingSafetyTimeout);
+      this.ui.hideLoadingOverlay();
     }
   }
 
@@ -216,6 +223,7 @@ class LiveTubeContentScript {
     this.player.stopAll();
     this.ui.updateVisualizer(false);
     this.ui.updateSubtitles('off', null, null);
+    this.ui.hideLoadingOverlay();
     if (updateBadge) {
       this.ui.updateStatusBadge('ready', 'Ready');
     }
@@ -393,20 +401,25 @@ class LiveTubeContentScript {
       return;
     }
 
-    this.ui.updateSubtitles(this.config.subMode, anchor.sourceText, `Đang tải giọng đọc... ${anchor.translatedText}`);
+    this.ui.updateSubtitles(this.config.subMode, anchor.sourceText, anchor.translatedText);
+    this.ui.showLoadingOverlay('Đang tải giọng đọc...');
 
-    if (!this.video.paused) {
-      this.video.pause();
+    try {
+      if (this.video && !this.video.paused) {
+        this.video.pause();
+      }
+
+      await this.prepareWindow('SEEK', anchor.index, LOOK_AHEAD_COUNT);
+      await this.waitForStreamReady(anchor.index, SEEK_BUFFER_TIMEOUT_MS);
+    } finally {
+      this.ui.hideLoadingOverlay();
+
+      if (token !== this.seekToken || !this.isDubbingEnabled) return;
+
+      this.transitionTo('PLAYING');
+      this.resumeVideo();
+      this.onTimeUpdate();
     }
-
-    await this.prepareWindow('SEEK', anchor.index, LOOK_AHEAD_COUNT);
-    await this.waitForStreamReady(anchor.index, SEEK_BUFFER_TIMEOUT_MS);
-
-    if (token !== this.seekToken || !this.isDubbingEnabled) return;
-
-    this.transitionTo('PLAYING');
-    this.resumeVideo();
-    this.onTimeUpdate();
   }
 
   private onVideoPause = (): void => {
@@ -457,8 +470,7 @@ class LiveTubeContentScript {
     const segment = this.segments.find((item) => item.index === this.activeSegmentIndex);
     if (!segment) return;
 
-    const prefix = this.state === 'SEEK_BUFFERING' || this.state === 'BUFFERING' ? 'Đang tải giọng đọc... ' : '';
-    this.ui.updateSubtitles(this.config.subMode, segment.sourceText, `${prefix}${segment.translatedText}`);
+    this.ui.updateSubtitles(this.config.subMode, segment.sourceText, segment.translatedText);
   }
 }
 
