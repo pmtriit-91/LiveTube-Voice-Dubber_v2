@@ -1,85 +1,178 @@
-# LiveTube Voice Dubber V2
+# LiveTube Voice Dubber V3
 
-A real-time Vietnamese voice dubbing system for YouTube videos, consisting of a Node.js Backend Service and a Chrome Extension. The system translates YouTube English subtitles and generates high-quality Vietnamese audio using Text-to-Speech (TTS) technology, synchronized directly with the video playback.
+Realtime Vietnamese translation and voice dubbing for YouTube videos.
 
----
+V3 is a rebuild around text-only persistence, in-memory scheduling, RAM audio cache, and HTTP chunked MP3 streaming. It does not write generated playback audio to disk and does not use polling to wait for audio files.
 
-## 🌟 Key Features
-
-*   **Real-time Subtitle Translation**: Automatically fetches English subtitles from YouTube, translates them into Vietnamese on-the-fly, and serves them to the player.
-*   **Edge-TTS Voice Generation**: Leverages Microsoft Edge TTS for natural-sounding, high-quality Vietnamese voiceovers.
-*   **Dual-Synchronized Playback**:
-    *   **Double-Check Audio Lock**: Ensures the Vietnamese audio aligns perfectly with the current video timestamp, preventing sound overlaps and drift.
-    *   **Dynamic Seek Buffer**: Intelligently handles video seeking (scrubbing), preparing audio segments around the new timestamp.
-    *   **Smart Pause**: Automatically pauses video playback at sentence boundaries if the corresponding audio segment is still being generated, then resumes seamlessly when ready.
-*   **Local Caching & Job Queueing**: Implements a SQLite-backed job queue to process TTS generation tasks efficiently and caches generated audio files to optimize network usage and avoid duplicate API calls.
-
----
-
-## 🏗️ System Architecture
-
-The project is structured into two main components:
-
-### 1. Backend Service (`/src`)
-A Node.js & TypeScript service powered by Express and SQLite.
-*   **API Server**: Handles session creation, subtitle translation, and audio streaming.
-*   **Job Queue Manager**: Manages concurrent TTS synthesis jobs using Python's `edge-tts` CLI.
-*   **Database**: Uses `better-sqlite3` to track active sessions, segment states, and worker tasks.
-*   **Cache Engine**: Manages physical audio assets (`.mp3` files) using a size-based Least Recently Used (LRU) cache policy.
-
-### 2. Chrome Extension (`/extension`)
-A lightweight content script built with TypeScript and bundled using `esbuild`.
-*   **YouTube Player Controller**: Directs the native HTML5 player, adjusting volume dynamically to prioritize the Vietnamese voiceover.
-*   **State Machine Manager**: Synchronizes audio playback with video events (`play`, `pause`, `seeking`, `ratechange`).
-*   **Serial Polling Worker**: Continuously polls the backend for pending segments and fetches them as soon as they become `READY`.
-
----
-
-## 🚀 Getting Started
-
-### Prerequisites
-*   [Bun](https://bun.sh/) (Recommended) or Node.js (v18+)
-*   [Python 3](https://www.python.org/) with `edge-tts` package installed in a virtual environment (`venv`).
-    *   The backend expects `edge-tts` to be accessible at: `/Users/phamminhtri/Desktop/train/LiveTube-Voice-Dubber/venv/bin/edge-tts` (or falls back to system CLI path).
-
----
-
-### Installation & Run
-
-#### 1. Start the Backend Server
-Navigate to the root directory, install dependencies, and start the development server:
-
-```bash
-# Install dependencies
-bun install
-
-# Start the server
-bun run dev
-```
-The server will start on [http://localhost:8765](http://localhost:8765).
-
-#### 2. Install the Chrome Extension
-1. Open Google Chrome and navigate to `chrome://extensions/`.
-2. Enable **Developer mode** (toggle switch in the top-right corner).
-3. Click **Load unpacked** in the top-left corner.
-4. Select the `/extension` directory inside this repository.
-5. The extension will automatically activate when you open any YouTube video.
-
----
-
-## 🛠️ Development & Build commands
+## Architecture
 
 ### Backend
-*   `bun run dev` - Runs the server using `ts-node` (hot reload).
-*   `bun run build` - Compiles TypeScript files into the `dist/` directory.
-*   `bun run clean` - Deletes temporary DB and build files.
 
-### Extension
-Navigate to `/extension` folder:
-*   `bun run build` - Bundles the content script into `extension/dist/content.js`.
-*   `bun run watch` - Starts esbuild in watch mode for development.
+The backend is a Node.js and TypeScript service using Express and SQLite.
 
----
+- `src/server.ts`: V3 HTTP API.
+- `src/db.ts`: text-only SQLite schema in `livetube_v3.db`.
+- `src/utils/yt-dlp.ts`: subtitle download, VTT parsing, sentence reconstruction.
+- `src/utils/translator.ts`: batch translation with glossary fallback.
+- `src/runtime/tts-stream.ts`: Edge-TTS stdout streaming via `--write-media -`.
+- `src/runtime/audio-cache.ts`: in-memory chunk cache with subscriber fan-out.
+- `src/runtime/tts-queue.ts`: event-driven in-memory TTS queue with seek cancellation and graceful degradation.
+- `src/runtime/rate-estimator.ts`: server-side rate estimation for long Vietnamese segments.
 
-## 📝 License
-This project is for educational and personal use. All rights reserved.
+### Chrome Extension
+
+The extension is bundled from `extension/src/content.ts`.
+
+- FSM states: `IDLE`, `INITIALIZING`, `BUFFERING`, `PLAYING`, `SEEK_BUFFERING`.
+- Audio playback uses `/api/stream/:sessionId/:segmentIndex` directly as an `<audio>` source.
+- UI Display Pagination splits long translated text into pages without using ellipsis clipping.
+- Soft fallback restores original YouTube audio if the dub stream errors, stalls, or times out.
+
+## V3 Guarantees
+
+- No SQLite `jobs` table.
+- No `audio_status`, `audio_path`, or static audio URL in segment records.
+- No generated MP3 playback files in `audio/cache`.
+- No `express.static('/audio/cache')`.
+- No audio polling loop.
+- No per-sentence video pause during normal playback.
+
+## API
+
+### `GET /status`
+
+Returns service health plus queue/cache metrics.
+
+### `POST /api/sessions`
+
+Creates or updates a session, downloads subtitles, translates timeline text, and returns text-only segments.
+
+Required JSON fields:
+
+```json
+{
+  "sessionId": "client-session-id",
+  "url": "https://www.youtube.com/watch?v=...",
+  "voice": "vi-VN-NamMinhNeural",
+  "rate": "+0%",
+  "volume": "+0%"
+}
+```
+
+### `POST /api/sessions/:id/prepare`
+
+Prepares a sliding window of TTS segments around an anchor index.
+
+```json
+{
+  "anchorIndex": 1,
+  "mode": "INITIAL",
+  "lookAhead": 5
+}
+```
+
+For `SEEK`, the backend cancels pending jobs outside the new smart seek window.
+
+### `GET /api/stream/:sessionId/:segmentIndex`
+
+Streams MP3 bytes with `Transfer-Encoding: chunked`.
+
+The endpoint subscribes the HTTP response to the in-memory audio cache entry. If the entry is pending, it enqueues TTS generation.
+
+## Requirements
+
+- Node.js 18+
+- npm
+- Python environment with `edge-tts` CLI, or system `edge-tts`
+- `yt-dlp` CLI for real YouTube subtitle download
+
+The backend checks these default CLI paths first:
+
+- Edge-TTS: `/Users/phamminhtri/Desktop/train/LiveTube-Voice-Dubber/venv/bin/edge-tts`
+- yt-dlp: `/Users/phamminhtri/Desktop/train/LiveTube-Voice-Dubber/venv/bin/yt-dlp`
+
+Both can fall back to binaries available on `PATH`.
+
+## Install
+
+```bash
+npm install
+cd extension
+npm install
+```
+
+## Run
+
+Backend:
+
+```bash
+npm run dev
+```
+
+The backend listens on `http://localhost:8765`.
+
+Extension:
+
+```bash
+cd extension
+npm run build
+```
+
+Then load the `extension` folder in Chrome via `chrome://extensions` with Developer mode enabled.
+
+## Build
+
+Backend:
+
+```bash
+npm run build
+```
+
+Extension:
+
+```bash
+cd extension
+npm run build
+```
+
+## Integration Smoke Test
+
+Start the backend first:
+
+```bash
+npm run dev
+```
+
+In another terminal:
+
+```bash
+npx ts-node src/test_integration.ts
+```
+
+The smoke test calls V3 HTTP endpoints:
+
+- `/status`
+- `/api/sessions`
+- `/api/sessions/:id/prepare`
+
+It intentionally does not test `/api/stream` by default because that endpoint can invoke real Edge-TTS generation.
+
+## Cleanup
+
+```bash
+npm run clean
+```
+
+This removes `dist` and local V3 SQLite database files.
+
+Generated subtitles and local DB files are ignored by Git.
+
+## Development Notes
+
+- `RATE_ESTIMATOR_ENABLED=false` disables server-side TTS rate estimation.
+- `TTS_MAX_CONCURRENT`, `TTS_MAX_SESSION_CONCURRENT`, `TTS_THROTTLE_FAILURE_THRESHOLD`, `TTS_THROTTLE_FAILURE_WINDOW_MS`, and `TTS_THROTTLE_RECOVERY_MS` tune queue behavior.
+- `AUDIO_CACHE_MAX_ENTRIES` and `AUDIO_CACHE_MAX_BYTES` tune in-memory audio cache limits.
+
+## License
+
+Personal and educational use.
