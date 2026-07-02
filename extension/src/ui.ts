@@ -235,8 +235,6 @@ export class GhostInterfaceManager {
         z-index: 2000;
         pointer-events: none;
         box-sizing: border-box;
-        max-height: 28%;
-        overflow: hidden;
       }
 
       .sub-en {
@@ -247,10 +245,8 @@ export class GhostInterfaceManager {
         margin: 0 0 6px 0;
         font-weight: normal;
         line-height: 1.35;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        -webkit-line-clamp: 2;
-        -webkit-box-orient: vertical;
+        white-space: normal;
+        overflow-wrap: break-word;
       }
 
       .sub-vi {
@@ -261,10 +257,8 @@ export class GhostInterfaceManager {
         text-shadow: -1.5px -1.5px 0 #000, 1.5px -1.5px 0 #000, -1.5px 1.5px 0 #000, 1.5px 1.5px 0 #000, 0 2px 6px rgba(0,0,0,0.95);
         margin: 0;
         line-height: 1.35;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        -webkit-line-clamp: 2;
-        -webkit-box-orient: vertical;
+        white-space: normal;
+        overflow-wrap: break-word;
       }
 
       #livetube-loading-overlay {
@@ -621,22 +615,141 @@ export class GhostInterfaceManager {
     if (subMode === 'vi' && viText) {
       enEl.style.display = 'none';
       viEl.textContent = viText;
-      viEl.style.display = '-webkit-box';
+      viEl.style.display = 'block';
     } else if (subMode === 'bilingual') {
       if (enText) {
         enEl.textContent = enText;
-        enEl.style.display = '-webkit-box';
+        enEl.style.display = 'block';
       } else {
         enEl.style.display = 'none';
       }
 
       if (viText) {
         viEl.textContent = viText;
-        viEl.style.display = '-webkit-box';
+        viEl.style.display = 'block';
       } else {
         viEl.style.display = 'none';
       }
     }
+  }
+
+  public getSubtitleLayoutSignature(): string {
+    if (!this.shadow) return 'unmounted';
+
+    const overlay = this.shadow.querySelector('#livetube-sub-overlay') as HTMLDivElement | null;
+    const enEl = this.shadow.querySelector('#livetube-sub-en') as HTMLParagraphElement | null;
+    const viEl = this.shadow.querySelector('#livetube-sub-vi') as HTMLParagraphElement | null;
+    const width = Math.round(overlay?.getBoundingClientRect().width || 0);
+    const enFont = enEl ? window.getComputedStyle(enEl).fontSize : '0px';
+    const viFont = viEl ? window.getComputedStyle(viEl).fontSize : '0px';
+
+    return `${width}:${enFont}:${viFont}`;
+  }
+
+  public paginateSubtitleText(text: string, variant: 'en' | 'vi'): string[] {
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    if (!normalized) return [];
+
+    if (!this.shadow || !this.subOverlay) {
+      return this.fallbackPaginateSubtitleText(normalized, variant);
+    }
+
+    if (this.doesSubtitlePageFit(normalized, variant)) {
+      return [normalized];
+    }
+
+    const words = normalized.split(/\s+/);
+    const pages: string[] = [];
+    let start = 0;
+
+    while (start < words.length) {
+      let bestEnd = -1;
+      let boundaryEnd = -1;
+
+      for (let end = start; end < words.length; end++) {
+        const candidate = words.slice(start, end + 1).join(' ');
+        if (!this.doesSubtitlePageFit(candidate, variant)) {
+          break;
+        }
+
+        bestEnd = end;
+        if (/[,.!?;:]$/.test(words[end])) {
+          boundaryEnd = end;
+        }
+      }
+
+      if (bestEnd < start) {
+        pages.push(words[start]);
+        start++;
+        continue;
+      }
+
+      const minBoundaryEnd = start + Math.floor((bestEnd - start + 1) * 0.55);
+      const pageEnd = boundaryEnd >= minBoundaryEnd ? boundaryEnd : bestEnd;
+      pages.push(words.slice(start, pageEnd + 1).join(' '));
+      start = pageEnd + 1;
+    }
+
+    return pages.length > 0 ? pages : [normalized];
+  }
+
+  private doesSubtitlePageFit(text: string, variant: 'en' | 'vi'): boolean {
+    if (!this.shadow || !this.subOverlay) {
+      const fallbackLimit = variant === 'vi' ? 72 : 88;
+      return text.length <= fallbackLimit;
+    }
+
+    const overlayWidth = Math.round(this.subOverlay.getBoundingClientRect().width);
+    if (overlayWidth <= 0) {
+      const fallbackLimit = variant === 'vi' ? 72 : 88;
+      return text.length <= fallbackLimit;
+    }
+
+    const measure = document.createElement('p');
+    measure.className = variant === 'vi' ? 'sub-vi' : 'sub-en';
+    measure.textContent = text;
+    measure.style.position = 'absolute';
+    measure.style.visibility = 'hidden';
+    measure.style.pointerEvents = 'none';
+    measure.style.left = '0';
+    measure.style.top = '0';
+    measure.style.width = `${overlayWidth}px`;
+    measure.style.maxHeight = 'none';
+    measure.style.overflow = 'visible';
+    measure.style.textOverflow = 'clip';
+    measure.style.display = 'block';
+
+    this.shadow.appendChild(measure);
+
+    const style = window.getComputedStyle(measure);
+    const fontSize = parseFloat(style.fontSize) || 18;
+    const lineHeight = parseFloat(style.lineHeight) || fontSize * 1.35;
+    const fits = measure.scrollHeight <= lineHeight * 2 + 2;
+
+    measure.remove();
+    return fits;
+  }
+
+  private fallbackPaginateSubtitleText(text: string, variant: 'en' | 'vi'): string[] {
+    const maxLength = variant === 'vi' ? 72 : 88;
+    if (text.length <= maxLength) return [text];
+
+    const words = text.split(/\s+/);
+    const pages: string[] = [];
+    let currentPage = '';
+
+    for (const word of words) {
+      const candidate = `${currentPage} ${word}`.trim();
+      if (candidate.length <= maxLength) {
+        currentPage = candidate;
+      } else {
+        if (currentPage) pages.push(currentPage);
+        currentPage = word;
+      }
+    }
+
+    if (currentPage) pages.push(currentPage);
+    return pages.length > 0 ? pages : [text];
   }
 
   public showLoadingOverlay(message = 'Đang chuẩn bị...') {

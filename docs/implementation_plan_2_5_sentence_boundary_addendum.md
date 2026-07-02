@@ -141,3 +141,16 @@ Rủi ro thật sự là cắt sai timing nếu cắt theo vị trí ký tự tr
 - Danh sách clause/incomplete starters vẫn chỉ áp dụng tiếng Anh vì reconstruction chạy trước dịch.
 
 Kết luận: Phase 2.5c là bước hardening chất lượng hiển thị và chia mệnh đề, vẫn nằm trước Phase 3 và không thay đổi kiến trúc V3.
+
+## 10. Superseded By Phase 2.5d
+
+Sau test thực tế tiếp theo, quyết định CSS clamp 2 dòng ở T48e không còn là hướng xử lý chính vì nó vẫn có thể xén chữ bằng `...`.
+
+Phase 2.5d thay thế phần hiển thị bằng UI Display Pagination:
+
+- Backend/TTS segment vẫn giữ nguyên để giọng đọc mượt.
+- Extension chia một segment dài thành nhiều display pages.
+- Mỗi page được đo trong Shadow DOM để vừa tối đa 2 dòng.
+- `line-clamp`, `text-overflow: ellipsis` và overflow clipping không còn dùng cho subtitle text.
+
+Chi tiết mới được ghi tại `docs/implementation_plan_2_5_ui_pagination.md`.

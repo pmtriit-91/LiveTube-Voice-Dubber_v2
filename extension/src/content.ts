@@ -5,6 +5,7 @@ const BACKEND_URL = 'http://localhost:8765';
 const INITIAL_BUFFER_TIMEOUT_MS = 10_000;
 const SEEK_BUFFER_TIMEOUT_MS = 8_000;
 const LOOK_AHEAD_COUNT = 5;
+const MIN_SUBTITLE_PAGE_WEIGHT = 1;
 
 interface VideoSegment {
   index: number;
@@ -25,6 +26,12 @@ interface SessionResponse {
 type PrepareMode = 'INITIAL' | 'PLAYBACK' | 'SEEK';
 type PlaybackState = 'IDLE' | 'INITIALIZING' | 'BUFFERING' | 'PLAYING' | 'SEEK_BUFFERING';
 
+interface SubtitlePageBundle {
+  enPages: string[];
+  viPages: string[];
+  weights: number[];
+}
+
 class LiveTubeContentScript {
   private sessionId: string;
   private state: PlaybackState = 'IDLE';
@@ -39,6 +46,8 @@ class LiveTubeContentScript {
   private activeSegmentIndex = -1;
   private isDubbingEnabled = false;
   private audioPlayVideoTime = 0;
+  private subtitlePageCache = new Map<string, SubtitlePageBundle>();
+  private lastRenderedSubtitleKey = '';
 
   private config: UIConfig = {
     voice: 'vi-VN-NamMinhNeural',
@@ -144,6 +153,7 @@ class LiveTubeContentScript {
 
   private handleConfigChange(newConfig: UIConfig): void {
     const voiceChanged = this.config.voice !== newConfig.voice;
+    const subModeChanged = this.config.subMode !== newConfig.subMode;
     this.config = newConfig;
     this.player.setDubVolume(newConfig.volume);
 
@@ -154,6 +164,11 @@ class LiveTubeContentScript {
       return;
     }
 
+    if (subModeChanged) {
+      this.subtitlePageCache.clear();
+      this.lastRenderedSubtitleKey = '';
+    }
+
     this.renderCurrentSubtitles();
   }
 
@@ -162,6 +177,8 @@ class LiveTubeContentScript {
     this.isDubbingEnabled = true;
     this.activeSegmentIndex = -1;
     this.segments = [];
+    this.subtitlePageCache.clear();
+    this.lastRenderedSubtitleKey = '';
     this.player.stopAll();
 
     this.transitionTo('INITIALIZING');
@@ -220,6 +237,8 @@ class LiveTubeContentScript {
     this.segments = [];
     this.activeSegmentIndex = -1;
     this.audioPlayVideoTime = 0;
+    this.subtitlePageCache.clear();
+    this.lastRenderedSubtitleKey = '';
     this.player.stopAll();
     this.ui.updateVisualizer(false);
     this.ui.updateSubtitles('off', null, null);
@@ -350,6 +369,8 @@ class LiveTubeContentScript {
       this.activeSegmentIndex = segment.index;
       this.playSegment(segment);
     }
+
+    this.renderCurrentSubtitles();
   };
 
   private playSegment(segment: VideoSegment): void {
@@ -363,7 +384,6 @@ class LiveTubeContentScript {
     this.audioPlayVideoTime = currentTime;
     this.transitionTo('PLAYING');
     this.ui.updateVisualizer(true);
-    this.ui.updateSubtitles(this.config.subMode, segment.sourceText, segment.translatedText);
     this.player.play(streamUrl, preloadUrl, remainingDuration);
 
     void this.prepareWindow('PLAYBACK', segment.index, LOOK_AHEAD_COUNT);
@@ -376,7 +396,7 @@ class LiveTubeContentScript {
     this.audioPlayVideoTime = 0;
     this.player.restoreVideoVolume();
     this.ui.updateVisualizer(false);
-    this.ui.updateSubtitles(this.config.subMode, null, null);
+    this.hideSubtitles();
   }
 
   private onVideoSeek = (): void => {
@@ -401,7 +421,7 @@ class LiveTubeContentScript {
       return;
     }
 
-    this.ui.updateSubtitles(this.config.subMode, anchor.sourceText, anchor.translatedText);
+    this.renderSegmentSubtitles(anchor, this.video.currentTime, true);
     this.ui.showLoadingOverlay('Đang tải giọng đọc...');
 
     try {
@@ -462,15 +482,163 @@ class LiveTubeContentScript {
   }
 
   private renderCurrentSubtitles(): void {
-    if (this.activeSegmentIndex === -1 || this.segments.length === 0) {
-      this.ui.updateSubtitles('off', null, null);
+    if (this.config.subMode === 'off' || this.activeSegmentIndex === -1 || this.segments.length === 0) {
+      this.hideSubtitles();
       return;
     }
 
     const segment = this.segments.find((item) => item.index === this.activeSegmentIndex);
     if (!segment) return;
 
-    this.ui.updateSubtitles(this.config.subMode, segment.sourceText, segment.translatedText);
+    this.renderSegmentSubtitles(segment, this.video?.currentTime ?? segment.start);
+  }
+
+  private renderSegmentSubtitles(segment: VideoSegment, currentTime: number, force = false): void {
+    if (this.config.subMode === 'off') {
+      this.hideSubtitles();
+      return;
+    }
+
+    const pages = this.getSubtitlePageBundle(segment);
+    const duration = Math.max(0.1, segment.end - segment.start);
+    const ratio = Math.max(0, Math.min(1, (currentTime - segment.start) / duration));
+    const pageIndex = this.selectWeightedPageIndex(pages.weights, ratio);
+
+    const enText = this.config.subMode === 'bilingual' ? pages.enPages[pageIndex] || null : null;
+    const viText = pages.viPages[pageIndex] || null;
+    const renderKey = `${this.config.subMode}:${segment.index}:${pageIndex}:${enText || ''}:${viText || ''}`;
+
+    if (!force && renderKey === this.lastRenderedSubtitleKey) return;
+
+    this.lastRenderedSubtitleKey = renderKey;
+    this.ui.updateSubtitles(this.config.subMode, enText, viText);
+  }
+
+  private hideSubtitles(): void {
+    if (this.lastRenderedSubtitleKey === 'hidden') return;
+
+    this.lastRenderedSubtitleKey = 'hidden';
+    this.ui.updateSubtitles('off', null, null);
+  }
+
+  private getSubtitlePageBundle(segment: VideoSegment): SubtitlePageBundle {
+    const cacheKey = `${segment.index}:${this.config.subMode}:${this.ui.getSubtitleLayoutSignature()}`;
+    const cached = this.subtitlePageCache.get(cacheKey);
+
+    if (cached) {
+      return cached;
+    }
+
+    const sourceText = this.normalizeSubtitleText(segment.sourceText);
+    const translatedText = this.normalizeSubtitleText(segment.translatedText || segment.sourceText);
+    let viPages = this.ui.paginateSubtitleText(translatedText, 'vi');
+    let enPages = this.config.subMode === 'bilingual'
+      ? this.ui.paginateSubtitleText(sourceText, 'en')
+      : [];
+
+    if (this.config.subMode === 'bilingual') {
+      const pageCount = Math.max(viPages.length, enPages.length, 1);
+
+      if (viPages.length !== pageCount) {
+        viPages = this.splitTextIntoPageCount(translatedText, pageCount);
+      }
+
+      if (enPages.length !== pageCount) {
+        enPages = this.splitTextIntoPageCount(sourceText, pageCount);
+      }
+    }
+
+    const weights = viPages.map((page, index) => (
+      this.calculateSubtitlePageWeight(page || enPages[index] || '')
+    ));
+    const bundle: SubtitlePageBundle = {
+      enPages,
+      viPages,
+      weights: weights.length > 0 ? weights : [MIN_SUBTITLE_PAGE_WEIGHT]
+    };
+
+    this.subtitlePageCache.set(cacheKey, bundle);
+    return bundle;
+  }
+
+  private splitTextIntoPageCount(text: string, pageCount: number): string[] {
+    const normalized = this.normalizeSubtitleText(text);
+    if (!normalized) return [];
+    if (pageCount <= 1) return [normalized];
+
+    const words = normalized.split(/\s+/);
+    const pages: string[] = [];
+    let start = 0;
+
+    for (let page = 0; page < pageCount; page++) {
+      if (start >= words.length) {
+        pages.push('');
+        continue;
+      }
+
+      const remainingPages = pageCount - page;
+      if (remainingPages === 1) {
+        pages.push(words.slice(start).join(' '));
+        break;
+      }
+
+      const remainingText = words.slice(start).join(' ');
+      const targetChars = Math.max(1, Math.ceil(remainingText.length / remainingPages));
+      const end = this.findNaturalPageBreak(words, start, targetChars);
+
+      pages.push(words.slice(start, end + 1).join(' '));
+      start = end + 1;
+    }
+
+    return pages;
+  }
+
+  private findNaturalPageBreak(words: string[], start: number, targetChars: number): number {
+    let charCount = 0;
+    let bestEnd = start;
+    let recentBoundary = -1;
+
+    for (let i = start; i < words.length; i++) {
+      charCount += words[i].length + (i === start ? 0 : 1);
+
+      if (/[,.!?;:]$/.test(words[i])) {
+        recentBoundary = i;
+      }
+
+      bestEnd = i;
+      if (charCount >= targetChars) {
+        return recentBoundary >= start && recentBoundary >= i - 4 ? recentBoundary : bestEnd;
+      }
+    }
+
+    return bestEnd;
+  }
+
+  private selectWeightedPageIndex(weights: number[], ratio: number): number {
+    if (weights.length <= 1) return 0;
+
+    const totalWeight = weights.reduce((sum, weight) => sum + Math.max(MIN_SUBTITLE_PAGE_WEIGHT, weight), 0);
+    const targetWeight = Math.min(totalWeight - Number.EPSILON, Math.max(0, ratio) * totalWeight);
+    let cursor = 0;
+
+    for (let i = 0; i < weights.length; i++) {
+      cursor += Math.max(MIN_SUBTITLE_PAGE_WEIGHT, weights[i]);
+      if (targetWeight < cursor) return i;
+    }
+
+    return weights.length - 1;
+  }
+
+  private calculateSubtitlePageWeight(text: string): number {
+    const normalized = this.normalizeSubtitleText(text);
+    if (!normalized) return MIN_SUBTITLE_PAGE_WEIGHT;
+
+    const wordCount = normalized.split(/\s+/).length;
+    return Math.max(MIN_SUBTITLE_PAGE_WEIGHT, normalized.length + wordCount * 4);
+  }
+
+  private normalizeSubtitleText(text: string): string {
+    return (text || '').replace(/\s+/g, ' ').trim();
   }
 }
 
