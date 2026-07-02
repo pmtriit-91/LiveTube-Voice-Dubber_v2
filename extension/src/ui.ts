@@ -139,6 +139,11 @@ export class GhostInterfaceManager {
         color: #34d399;
       }
 
+      .status-badge.fallback {
+        background: rgba(245, 158, 11, 0.15);
+        color: #fbbf24;
+      }
+
       .row {
         display: flex;
         align-items: center;
@@ -543,7 +548,7 @@ export class GhostInterfaceManager {
   /**
    * Cập nhật trạng thái kết nối server hiển thị trên badge
    */
-  public updateStatusBadge(status: 'offline' | 'ready' | 'active', text: string) {
+  public updateStatusBadge(status: 'offline' | 'ready' | 'active' | 'fallback', text: string) {
     if (!this.shadow) return;
     const badge = this.shadow.querySelector('#dubber-status');
     const toggle = this.shadow.querySelector('#dubber-toggle') as HTMLInputElement;
@@ -560,7 +565,7 @@ export class GhostInterfaceManager {
       } else if (status === 'ready') {
         toggle.disabled = false;
         toggle.checked = false;
-      } else if (status === 'active') {
+      } else if (status === 'active' || status === 'fallback') {
         toggle.disabled = false;
         toggle.checked = true;
       }
@@ -568,7 +573,7 @@ export class GhostInterfaceManager {
 
     // Cập nhật trạng thái màu sắc cho nút Headphones ở YouTube control bar
     if (this.controlBtn) {
-      if (status === 'active') {
+      if (status === 'active' || status === 'fallback') {
         this.controlBtn.classList.add('dubbing-on');
       } else {
         this.controlBtn.classList.remove('dubbing-on');

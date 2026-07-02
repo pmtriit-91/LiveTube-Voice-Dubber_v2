@@ -182,14 +182,13 @@ Yêu cầu tối thiểu:
 
 ### T32/T33 - Client Soft Fallback
 
-Chưa làm trong Phase 3A.
-
-Khi làm Phase 3B:
+Phase 3B:
 
 - `player.ts` phát callback/event khi `error`, `stalled` hoặc playback promise reject.
 - `content.ts` nhận fallback signal, restore tiếng gốc, giữ UI Pagination chạy.
 - Không pause video.
 - Không reset timeline/subtitle page cache.
+- UI dùng badge `fallback` riêng thay vì `offline`, vì `offline` sẽ disable toggle và làm người dùng tưởng dubbing đã bị tắt.
 
 ## 9. Verification Plan
 
@@ -208,6 +207,12 @@ Phase 3B:
 - Tiếng gốc được restore.
 - UI Pagination vẫn lật page theo timeline.
 - Badge/status báo fallback nhưng không disable toàn bộ dubbing.
+
+Implementation note sau Phase 3B:
+
+- Fallback được phát từ `extension/src/player.ts` cho `error`, `stalled`, startup timeout, playback promise reject và resume reject.
+- `extension/src/content.ts` chỉ chuyển trạng thái UI sang `fallback`, không clear active segment và không clear subtitle pagination cache.
+- `extension/src/ui.ts` giữ toggle enabled/checked ở trạng thái fallback.
 
 ## 10. Rollback Notes
 

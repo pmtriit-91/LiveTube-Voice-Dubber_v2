@@ -1,4 +1,5 @@
 import { DoubleBufferedAudioPlayer } from './player';
+import type { AudioFallbackEvent } from './player';
 import { GhostInterfaceManager, UIConfig } from './ui';
 
 const BACKEND_URL = 'http://localhost:8765';
@@ -48,6 +49,7 @@ class LiveTubeContentScript {
   private audioPlayVideoTime = 0;
   private subtitlePageCache = new Map<string, SubtitlePageBundle>();
   private lastRenderedSubtitleKey = '';
+  private fallbackSegmentIndex = -1;
 
   private config: UIConfig = {
     voice: 'vi-VN-NamMinhNeural',
@@ -58,6 +60,8 @@ class LiveTubeContentScript {
   constructor() {
     this.sessionId = this.createSessionId();
     this.player = new DoubleBufferedAudioPlayer();
+    this.player.setFallbackHandler((event) => this.handleAudioFallback(event));
+    this.player.setPlayingHandler(() => this.handleDubAudioPlaying());
     this.ui = new GhostInterfaceManager();
   }
 
@@ -176,6 +180,7 @@ class LiveTubeContentScript {
     const token = ++this.lifecycleToken;
     this.isDubbingEnabled = true;
     this.activeSegmentIndex = -1;
+    this.fallbackSegmentIndex = -1;
     this.segments = [];
     this.subtitlePageCache.clear();
     this.lastRenderedSubtitleKey = '';
@@ -236,6 +241,7 @@ class LiveTubeContentScript {
     this.isDubbingEnabled = false;
     this.segments = [];
     this.activeSegmentIndex = -1;
+    this.fallbackSegmentIndex = -1;
     this.audioPlayVideoTime = 0;
     this.subtitlePageCache.clear();
     this.lastRenderedSubtitleKey = '';
@@ -367,6 +373,7 @@ class LiveTubeContentScript {
 
     if (segment.index !== this.activeSegmentIndex) {
       this.activeSegmentIndex = segment.index;
+      this.fallbackSegmentIndex = -1;
       this.playSegment(segment);
     }
 
@@ -383,6 +390,7 @@ class LiveTubeContentScript {
 
     this.audioPlayVideoTime = currentTime;
     this.transitionTo('PLAYING');
+    this.ui.updateStatusBadge('active', 'Active');
     this.ui.updateVisualizer(true);
     this.player.play(streamUrl, preloadUrl, remainingDuration);
 
@@ -393,6 +401,7 @@ class LiveTubeContentScript {
     if (this.activeSegmentIndex === -1) return;
 
     this.activeSegmentIndex = -1;
+    this.fallbackSegmentIndex = -1;
     this.audioPlayVideoTime = 0;
     this.player.restoreVideoVolume();
     this.ui.updateVisualizer(false);
@@ -412,6 +421,7 @@ class LiveTubeContentScript {
     this.player.stopAll();
     this.ui.updateVisualizer(false);
     this.activeSegmentIndex = -1;
+    this.fallbackSegmentIndex = -1;
     this.audioPlayVideoTime = 0;
 
     const anchor = this.findAnchorSegment(this.video.currentTime);
@@ -463,6 +473,32 @@ class LiveTubeContentScript {
       }, 300);
     }
   };
+
+  private handleAudioFallback(event: AudioFallbackEvent): void {
+    if (!this.isDubbingEnabled || this.state !== 'PLAYING') return;
+    if (this.activeSegmentIndex === -1) return;
+    if (this.fallbackSegmentIndex === this.activeSegmentIndex) return;
+
+    this.fallbackSegmentIndex = this.activeSegmentIndex;
+    this.player.restoreVideoVolume();
+    this.ui.updateVisualizer(false);
+    this.ui.updateStatusBadge('fallback', 'Tiếng gốc');
+    this.renderCurrentSubtitles();
+
+    console.warn('[LiveTube] Soft fallback to original audio:', {
+      segmentIndex: this.activeSegmentIndex,
+      reason: event.reason,
+      message: event.message
+    });
+  }
+
+  private handleDubAudioPlaying(): void {
+    if (!this.isDubbingEnabled || this.state !== 'PLAYING') return;
+
+    this.fallbackSegmentIndex = -1;
+    this.ui.updateStatusBadge('active', 'Active');
+    this.ui.updateVisualizer(true);
+  }
 
   private onPlaybackRateChange = (): void => {
     if (!this.isDubbingEnabled || !this.video) return;
